@@ -93,7 +93,11 @@ function renderStatus() {
   const badge = $("mode-badge");
   badge.textContent = config.dryRun ? "DRY_RUN: nur Anzeige" : "Aktiv: verschiebt";
   badge.className = `badge ${config.dryRun ? "dry" : "live"}`;
-  $("last-run").textContent = status.lastRun ? `Letzter Lauf ${ago(status.lastRun.at, now)}` : "Noch kein Lauf";
+  const runInfo = [status.lastRun ? `Letzter Lauf ${ago(status.lastRun.at, now)}` : "Noch kein Lauf"];
+  if (config.accountId && status.nextRunAt > now) {
+    runInfo.push(`nächste Prüfung ${new Date(status.nextRunAt).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })}`);
+  }
+  $("last-run").textContent = runInfo.join(", ");
   renderAlerts(config, status);
 
   const missing = new Set((status.folderProblems ?? []).map((p) => p.folder));
@@ -209,7 +213,7 @@ function renderLog() {
 
 let statusTimer = null;
 function scheduleStatus() {
-  if (statusTimer) return;
+  if (statusTimer || document.hidden) return;
   statusTimer = setTimeout(() => {
     statusTimer = null;
     renderStatus();
@@ -218,10 +222,31 @@ function scheduleStatus() {
 
 // ---------------------------------------------------------------- settings
 
-async function loadFolders(accountId) {
-  if (!accountId || folderCache.has(accountId)) return;
+/** Loads the folder tree of an account; `fresh` reads it again. Returns whether it changed. */
+async function loadFolders(accountId, fresh = false) {
+  if (!accountId || (!fresh && folderCache.has(accountId))) return false;
   const account = await messenger.accounts.get(accountId, true);
+  const before = JSON.stringify(folderCache.get(accountId)?.folders.map((f) => f.path) ?? null);
   folderCache.set(accountId, account ? { root: account.rootFolder, folders: listFolders(account.rootFolder) } : null);
+  return before !== JSON.stringify(folderCache.get(accountId)?.folders.map((f) => f.path) ?? null);
+}
+
+let pendingSettingsRender = false;
+
+/** Re-renders the settings, but not while the user is typing in one of its fields. */
+function renderSettingsSoon() {
+  const active = document.activeElement;
+  if (active && $("tab-settings").contains(active) && active.matches("input[type=text], input[type=number], textarea")) {
+    pendingSettingsRender = true;
+    return;
+  }
+  pendingSettingsRender = false;
+  renderSettings();
+}
+
+/** Folders were created, renamed, moved or deleted somewhere: show the current tree. */
+async function refreshFolders() {
+  if (await loadFolders(draft.accountId, true)) renderSettingsSoon();
 }
 
 function markDirty() {
@@ -424,6 +449,7 @@ function wire() {
     button.textContent = "Läuft …";
     try {
       await send("runNow");
+      await refreshFolders();
     } finally {
       button.disabled = false;
       button.textContent = "Jetzt prüfen";
@@ -555,7 +581,19 @@ async function init() {
   const wanted = location.hash.slice(1);
   showTab(wanted === "settings" || wanted === "status" ? wanted : saved.accountId ? "status" : "settings");
   messenger.storage.onChanged.addListener(onStorageChanged);
-  setInterval(renderStatus, 30_000);
+  for (const event of ["onCreated", "onRenamed", "onMoved", "onDeleted"]) messenger.folders[event].addListener(refreshFolders);
+  document.addEventListener("focusout", () => {
+    if (pendingSettingsRender) setTimeout(renderSettingsSoon, 0);
+  });
+  // Nothing to redraw while the tab is in the background; catch up when it is shown again.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    renderStatus();
+    refreshFolders();
+  });
+  setInterval(() => {
+    if (!document.hidden) renderStatus();
+  }, 30_000);
 }
 
 init().catch((e) => {

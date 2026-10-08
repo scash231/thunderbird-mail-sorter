@@ -45,6 +45,13 @@ function setup({ limits = {}, subfolders = SUBFOLDERS } = {}) {
       await mock.restart();
       env.sorter = make();
     },
+    /** The background page was suspended and wakes up again (same session, empty memory). */
+    wake() {
+      env.sorter = make();
+    },
+    dueAlarm() {
+      return mock.alarms.get("mail-sorter-due")?.when ?? null;
+    },
     async setConfig(patch = {}) {
       await mock.api.storage.local.set({ config: { ...defaultConfig(), accountId: "account1", ...patch } });
     },
@@ -413,25 +420,30 @@ describe("sorter: robustness", () => {
     await env.sorter.tick("start");
     assert.deepEqual(env.inInbox(), ["Klemmt"]);
     assert.deepEqual(env.inFolder("dev@braunben.de"), ["Läuft"]);
+    // one move for both, then each on its own to find the bad one
+    assert.deepEqual(env.mock.calls.move.map((c) => c.ids.length), [2, 1, 1]);
+    const base = env.mock.calls.move.length - 1;
     let attempts = 1;
     for (const wait of [1, 5, 15, 60]) {
+      const rescan = (await env.stored()).status.scan.at + 60 * MIN;
+      assert.equal(env.dueAlarm(), Math.min(env.clock.t + wait * MIN + 10_000, rescan), "wakes up for the retry (or the earlier re-scan)");
       env.advance(wait - 0.5);
       await env.sorter.tick();
-      assert.equal(env.mock.calls.move.length - 1, attempts, `no retry before ${wait} min`);
+      assert.equal(env.mock.calls.move.length - base, attempts, `no retry before ${wait} min`);
       env.advance(0.5);
       await env.sorter.tick();
       attempts++;
-      assert.equal(env.mock.calls.move.length - 1, attempts);
+      assert.equal(env.mock.calls.move.length - base, attempts);
     }
     env.advance(600);
     await env.sorter.tick();
-    assert.equal(env.mock.calls.move.length - 1, 5);
+    assert.equal(env.mock.calls.move.length - base, 5);
     const { log, index } = await env.stored();
     assert.match(log[0].text, /Versuch 5.*Kein weiterer Versuch/);
     assert.equal(Object.values(index)[0].gaveUp, true);
     // "Jetzt prüfen" gives it another chance
     await env.sorter.tick("manual");
-    assert.equal(env.mock.calls.move.length - 1, 6);
+    assert.equal(env.mock.calls.move.length - base, 6);
   });
 
   it("moves at most maxMovesPerRun mails per run, oldest first", async () => {
@@ -477,8 +489,9 @@ describe("sorter: robustness", () => {
       env.sorter.tick("manual"),
       env.sorter.tick("alarm"),
     ]);
-    assert.equal(env.mock.calls.move.length, 5);
-    assert.deepEqual(new Set(env.mock.calls.move.map((c) => c.ids[0])).size, 5);
+    const movedIds = env.mock.calls.move.flatMap((c) => c.ids);
+    assert.equal(movedIds.length, 5);
+    assert.equal(new Set(movedIds).size, 5);
     assert.deepEqual(env.inInbox(), []);
   });
 
@@ -579,6 +592,139 @@ describe("sorter: robustness", () => {
     env.api.messages.continueList = async (id) => followUps[id] ?? realContinue(id);
     await env.sorter.onNewMail(env.inbox(), { id: "evt-1", messages: msgs.slice(0, 3) });
     assert.equal(env.inFolder("spam@braunben.de").length, 7);
+  });
+});
+
+describe("sorter: saving resources", () => {
+  it("wakes up when the next mail is due instead of every minute", async () => {
+    const env = setup();
+    await env.setConfig({ dryRun: false });
+    await env.arrive("Erste");
+    assert.equal(env.dueAlarm(), T0 + 45 * MIN + 10_000);
+    env.advance(5);
+    await env.arrive("Zweite");
+    assert.equal(env.dueAlarm(), T0 + 45 * MIN + 10_000, "the earlier mail decides");
+
+    env.clock.t = T0 + 45 * MIN + 10_000;
+    await env.sorter.tick("alarm");
+    assert.deepEqual(env.inInbox(), ["Zweite"]);
+    assert.equal(env.dueAlarm(), T0 + 50 * MIN + 10_000);
+
+    env.clock.t = T0 + 50 * MIN + 10_000;
+    await env.sorter.tick("alarm");
+    assert.deepEqual(env.inInbox(), []);
+    const { status } = await env.stored();
+    assert.equal(env.dueAlarm(), status.scan.at + 60 * MIN, "then only the hourly re-scan");
+  });
+
+  it("continues a backlog one minute later", async () => {
+    const env = setup();
+    await env.setConfig({ dryRun: false, maxMovesPerRun: 2 });
+    for (let i = 1; i <= 3; i++) env.mail(`Mail ${i}`, { ago: 100 });
+    await env.sorter.tick("start");
+    assert.equal(env.inInbox().length, 1);
+    assert.equal(env.dueAlarm(), env.clock.t + 60_000);
+  });
+
+  it("does not wake up again for mails DRY_RUN has reported or whose folder is missing", async () => {
+    const env = setup({ subfolders: SUBFOLDERS.filter((f) => f !== "gaming@braunben.de") });
+    await env.setConfig();
+    await env.arrive("Gemeldet", { ago: 60 });
+    await env.arrive("Ohne Ordner", { to: "gaming@braunben.de", ago: 60 });
+    const { status } = await env.stored();
+    assert.equal(env.dueAlarm(), status.scan.at + 60 * MIN);
+  });
+
+  it("moves a waiting mail as soon as its missing folder is created", async () => {
+    const env = setup({ subfolders: SUBFOLDERS.filter((f) => f !== "gaming@braunben.de") });
+    await env.setConfig({ dryRun: false });
+    await env.arrive("Spiel", { to: "gaming@braunben.de", ago: 60 });
+    assert.deepEqual(env.inInbox(), ["Spiel"]);
+    const folder = env.mock.addFolder("account1", "INBOX", "gaming@braunben.de");
+    await env.sorter.onFoldersChanged(folder);
+    assert.deepEqual(env.inFolder("gaming@braunben.de"), ["Spiel"]);
+    assert.deepEqual((await env.stored()).status.folderProblems, []);
+  });
+
+  it("ignores folder events of other accounts", async () => {
+    const env = setup();
+    await env.setConfig();
+    await env.sorter.tick("start");
+    const before = env.mock.calls.accountsGet;
+    await env.sorter.onFoldersChanged(env.mock.addFolder("account2", "INBOX", "neu"));
+    assert.equal(env.mock.calls.accountsGet, before);
+  });
+
+  it("moves all due mails of one folder with a single command", async () => {
+    const env = setup();
+    await env.setConfig({ dryRun: false });
+    for (let i = 1; i <= 3; i++) env.mail(`Dev ${i}`, { ago: 60 });
+    env.mail("Job", { to: "job@braunben.de", ago: 60 });
+    await env.sorter.tick("start");
+    assert.deepEqual(env.mock.calls.move.map((c) => c.ids.length).sort(), [1, 3]);
+    assert.deepEqual(env.inInbox(), []);
+  });
+
+  it("an idle wake-up reads only what it needs and writes nothing", async () => {
+    const env = setup();
+    await env.setConfig({ dryRun: false });
+    await env.arrive("Wartet");
+    env.wake();
+    const { reads, writes } = env.api.storage.local;
+    const r = reads.length;
+    const w = writes.length;
+    env.advance(20);
+    await env.sorter.tick("alarm");
+    assert.deepEqual(reads.slice(r), [["config", "index", "status"]]);
+    assert.deepEqual(writes.slice(w), []);
+  });
+
+  it("keeps the state in memory while awake", async () => {
+    const env = setup();
+    await env.setConfig({ dryRun: false });
+    await env.sorter.tick("start");
+    const r = env.api.storage.local.reads.length;
+    await env.arrive("Eins");
+    await env.arrive("Zwei");
+    env.advance(1);
+    await env.sorter.tick("alarm");
+    assert.deepEqual(env.api.storage.local.reads.slice(r), [], "nothing read again");
+    env.advance(45);
+    await env.sorter.tick("alarm");
+    assert.deepEqual(env.api.storage.local.reads.slice(r), [["log"]], "the log is read once, when the first move is logged");
+  });
+
+  it("does not touch the stored mails for events from other folders", async () => {
+    const env = setup();
+    await env.setConfig({ dryRun: false });
+    await env.arrive("Im Posteingang");
+    env.wake();
+    const r = env.api.storage.local.reads.length;
+    const sent = env.mock.addMessage({ path: "Sent", subject: "Gesendet", headers: "To: x@example.org" });
+    await env.sorter.onMoved(...env.mock.moveByUser(sent.id, "account1", "Trash"));
+    await env.sorter.onDeleted(env.mock.deleteMessage(env.mock.findId("Gesendet")));
+    const other = env.mail("Anderes Konto", { accountId: "account2" });
+    await env.sorter.onNewMail(env.inbox("account2"), { id: "evt-9", messages: [other] });
+    assert.deepEqual(env.api.storage.local.reads.slice(r), [["config"]]);
+    assert.deepEqual(env.mock.calls.abortList, ["evt-9"], "the unread rest of the event list is released");
+    assert.equal(env.mock.calls.getFull.length, 1);
+  });
+
+  it("re-reads the settings after they were changed", async () => {
+    const env = setup();
+    await env.setConfig();
+    await env.arrive("Test", { ago: 60 });
+    assert.equal(env.mock.calls.move.length, 0);
+    await env.setConfig({ dryRun: false });
+    await env.sorter.tick("config");
+    assert.deepEqual(env.inFolder("dev@braunben.de"), ["Test"]);
+  });
+
+  it("schedules nothing without an account", async () => {
+    const env = setup();
+    await env.api.storage.local.set({ config: defaultConfig() });
+    await env.sorter.tick("start");
+    assert.equal(env.dueAlarm(), null);
   });
 });
 

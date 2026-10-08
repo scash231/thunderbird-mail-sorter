@@ -41,14 +41,19 @@ export function buildTree(accountId, spec) {
 
 function storageArea() {
   let data = {};
-  return {
+  const area = {
+    /** Keys asked for by each get(), keys written by each set(). */
+    reads: [],
+    writes: [],
     async get(keys) {
       const list = keys == null ? Object.keys(data) : typeof keys === "string" ? [keys] : Array.isArray(keys) ? keys : Object.keys(keys);
+      area.reads.push([...list]);
       const out = {};
       for (const k of list) if (k in data) out[k] = structuredClone(data[k]);
       return out;
     },
     async set(obj) {
+      area.writes.push(Object.keys(obj));
       for (const [k, v] of Object.entries(obj)) data[k] = structuredClone(v);
     },
     async clear() {
@@ -56,6 +61,7 @@ function storageArea() {
     },
     raw: () => data,
   };
+  return area;
 }
 
 /** Header text ("Name: value" lines, folded lines kept) -> rawHeaders dictionary like getFull(). */
@@ -89,7 +95,8 @@ export function createMockMessenger() {
   let listSeq = 0;
   let moveDelayMs = 0;
   const failMoves = new Map(); // subject -> remaining failures (Infinity = always)
-  const calls = { getFull: [], get: [], move: [], list: 0, accountsGet: 0 };
+  const calls = { getFull: [], get: [], move: [], list: 0, accountsGet: 0, abortList: [] };
+  const alarms = new Map();
   const PAGE = 3;
 
   const folderInfo = (f) => {
@@ -154,6 +161,10 @@ export function createMockMessenger() {
         lists.delete(id);
         return page(rest);
       },
+      async abortList(id) {
+        calls.abortList.push(id);
+        lists.delete(id);
+      },
       async get(id) {
         calls.get.push(id);
         const m = messages.get(id);
@@ -191,6 +202,17 @@ export function createMockMessenger() {
       },
     },
     storage: { local: storageArea(), session: storageArea() },
+    alarms: {
+      async create(name, info) {
+        alarms.set(name, { name, ...info });
+      },
+      async clear(name) {
+        return alarms.delete(name);
+      },
+      async get(name) {
+        return alarms.get(name);
+      },
+    },
     action: {
       badge: "",
       async setBadgeText({ text }) {
@@ -205,7 +227,28 @@ export function createMockMessenger() {
   return {
     api,
     calls,
+    alarms,
     folderId,
+    /** Creates a folder like the user would; returns it (as folders.onCreated would). */
+    addFolder(accountId, parentPath, name) {
+      const parent = folders.get(folderId(accountId, parentPath));
+      const folder = {
+        id: `${parent.id}/${name}`,
+        accountId,
+        name,
+        path: `${parent.path}/${name}`,
+        specialUse: [],
+        isRoot: false,
+        isFavorite: false,
+        isTag: false,
+        isUnified: false,
+        isVirtual: false,
+        subFolders: [],
+      };
+      parent.subFolders.push(folder);
+      register(folder);
+      return folderInfo(folder);
+    },
     addAccount(id, spec, name = "IONOS") {
       const rootFolder = buildTree(id, spec);
       accounts.set(id, { id, name, type: "imap", rootFolder, identities: [] });
@@ -272,6 +315,7 @@ export function createMockMessenger() {
     async restart() {
       await api.storage.session.clear();
       lists.clear();
+      alarms.clear(); // Thunderbird does not keep alarms across a restart
       const all = [...messages.values()].reverse();
       messages.clear();
       nextId = 1;

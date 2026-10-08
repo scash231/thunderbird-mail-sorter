@@ -7,31 +7,45 @@
 //   index   - tracked inbox messages, id -> entry (see fetchEntry)
 //   history - "key|folder" -> time of our move, to leave mails alone that were moved back
 //   log     - newest first
-//   status  - last run, last scan, folder problems, current error
+//   status  - last run, last scan, folder problems, current error, next wake-up
 // Message ids are only valid for one Thunderbird session, so every entry remembers the
 // session it was seen in (storage.session) and the inbox is re-listed after a restart.
+//
+// Saving resources: the background page sleeps between events. It is woken by a one-shot
+// alarm at the time the next mail is due (plus an hourly heartbeat), not every minute.
+// While awake it keeps the state in memory and reads only the keys a task needs; the
+// background is the only writer apart from the options page, which only writes config.
 
 import { arrivalTime, findRuleInTops, messageKey, planEntry, topValues } from "./classify.js";
 import { effectiveRules, loadConfig, neededHeaders } from "./config.js";
 import { findInbox, resolveTargets, sameFolder } from "./folders.js";
 import { headersFromPart } from "./headers.js";
 
-export const ALARM_NAME = "mail-sorter-tick";
+/** Periodic safety net (and the hourly re-scan). */
+export const ALARM_HEARTBEAT = "mail-sorter-tick";
+export const HEARTBEAT_MINUTES = 60;
+/** One-shot alarm at the next moment something is due. */
+export const ALARM_DUE = "mail-sorter-due";
 
 export const LIMITS = {
   /** messages.getFull calls per scan pass, the rest follows in the next run. */
   fetchPerScan: 100,
   /** Re-list the whole inbox this often, as a safety net for missed events. */
   rescanMinutes: 60,
-  logSize: 1000,
+  logSize: 500,
   historyDays: 90,
   /** Failed moves of one message before giving up (until the next start). */
   maxAttempts: 5,
   /** Save progress after this many fetched messages during a scan. */
   checkpointEvery: 20,
+  /** Wake up this long after a due time, so mails due within seconds go in one run. */
+  coalesceMs: 10_000,
+  /** Pause between runs while there is a backlog (batch limit reached, scan unfinished). */
+  backlogMs: 60_000,
 };
 const RETRY_MINUTES = [1, 5, 15, 60];
 const FETCH_RETRY_MINUTES = 15;
+const STATE_DEFAULTS = { index: () => ({}), history: () => ({}), log: () => [], status: () => ({}) };
 
 function errorText(e) {
   return (e && typeof e === "object" && "message" in e ? e.message : String(e)) || "Unbekannter Fehler";
@@ -52,10 +66,31 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
   let tickQueued = null;
   const tickReasons = new Set();
   let badge = null;
+  let scheduledWake = null;
+  let configStale = false;
+  let cache = freshCache();
 
-  /** Runs fn after everything queued before it. One task at a time. */
+  function freshCache() {
+    return { loaded: new Set(), dirty: new Set(), pendingLog: [] };
+  }
+
+  /**
+   * Runs fn after everything queued before it. One task at a time. A task that fails
+   * drops the in-memory state, so the next one starts again from what is stored.
+   */
   function exclusive(fn) {
-    const run = tail.then(fn);
+    const run = tail.then(async () => {
+      if (configStale) {
+        configStale = false;
+        cache.loaded.delete("config");
+      }
+      try {
+        return await fn();
+      } catch (e) {
+        cache = freshCache();
+        throw e;
+      }
+    });
     tail = run.catch(() => {});
     return run;
   }
@@ -72,22 +107,34 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
     return (sessionId = id);
   }
 
-  async function load() {
-    const data = await api.storage.local.get(["config", "index", "history", "log", "status"]);
-    const { config, problems } = loadConfig(data.config);
-    return {
-      config,
-      configProblems: problems,
-      rules: effectiveRules(config),
-      index: data.index ?? {},
-      history: data.history ?? {},
-      log: data.log ?? [],
-      status: data.status ?? {},
-      dirty: new Set(),
-    };
+  /** The shared state with config and the given keys loaded (each read once per wake-up). */
+  async function load(...keys) {
+    const want = ["config", ...keys].filter((k) => !cache.loaded.has(k));
+    if (want.length) {
+      const data = await api.storage.local.get(want);
+      for (const k of want) {
+        if (k === "config") {
+          const { config, problems } = loadConfig(data.config);
+          cache.config = config;
+          cache.configProblems = problems;
+          cache.rules = effectiveRules(config);
+        } else {
+          cache[k] = data[k] ?? STATE_DEFAULTS[k]();
+        }
+        cache.loaded.add(k);
+      }
+    }
+    return cache;
   }
 
   async function save(ctx) {
+    if (ctx.pendingLog.length) {
+      // The log is only read when there is something to add to it.
+      await load("log");
+      ctx.log = [...ctx.pendingLog.reverse(), ...ctx.log].slice(0, L.logSize);
+      ctx.pendingLog = [];
+      ctx.dirty.add("log");
+    }
     if (ctx.dirty.size === 0) return;
     const out = {};
     for (const key of ctx.dirty) out[key] = ctx[key];
@@ -96,9 +143,7 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
   }
 
   function addLog(ctx, entry) {
-    ctx.log.unshift({ t: now(), ...entry });
-    if (ctx.log.length > L.logSize) ctx.log.length = L.logSize;
-    ctx.dirty.add("log");
+    ctx.pendingLog.push({ t: now(), ...entry });
   }
 
   async function collect(list) {
@@ -166,7 +211,7 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
 
   /**
    * Stores a freshly fetched entry. Leaves it alone if we moved it out of the inbox before,
-   * or if the user moved it into the inbox (byUser).
+   * or if the user moved it into the inbox (byUser). Needs index and history loaded.
    */
   function storeEntry(ctx, entry, { byUser = false } = {}) {
     const id = freeId(ctx.index, entry.key);
@@ -189,6 +234,7 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
   }
 
   async function addMessages(ctx, msgs, session, { byUser = false } = {}) {
+    await load("index", "history");
     const known = new Set();
     for (const e of Object.values(ctx.index)) if (e.session === session) known.add(e.msgId);
     for (const msg of msgs) {
@@ -211,18 +257,25 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
   /**
    * Lists the inbox and brings the index in line with it: known messages get their new
    * session id (no header fetch), vanished ones are dropped, new ones are fetched,
-   * newest first, at most L.fetchPerScan per pass.
+   * newest first, at most L.fetchPerScan per pass. Writes the index only if it changed.
    */
   async function scan(ctx, inbox, session) {
+    await load("index", "history", "status");
     const t = now();
+    let changed = false;
+    const drop = (id) => {
+      delete ctx.index[id];
+      changed = true;
+    };
     for (const [id, e] of Object.entries(ctx.index)) {
-      if (e.accountId !== ctx.config.accountId) delete ctx.index[id]; // another account was chosen
+      if (e.accountId !== ctx.config.accountId) drop(id); // another account was chosen
     }
     const listed = await collect(api.messages.list(inbox.id));
     const tracked = Object.values(ctx.index);
     if (listed.length === 0 && tracked.length > 0 && !ctx.status.scan?.emptySeen) {
       // An empty list while we track messages: check again next run before forgetting.
       ctx.status.scan = { ...ctx.status.scan, at: t, complete: false, emptySeen: true };
+      if (changed) ctx.dirty.add("index");
       return;
     }
 
@@ -262,10 +315,15 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
             delete e.gaveUp;
             delete e.attempts;
             delete e.nextTryAt;
+            changed = true;
           }
-          e.subject = msg.subject ?? e.subject;
+          if (msg.subject !== undefined && msg.subject !== e.subject) {
+            e.subject = msg.subject;
+            changed = true;
+          }
           if (refetch) {
             e.session = null; // not usable until fetched again
+            changed = true;
             todo.push({ msgs: [msg], prevs: [e], firstSeen: e.firstSeen, date: msg.date });
           } else {
             keep.add(e.id);
@@ -276,14 +334,15 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
       // New message, or several copies of one mail (one per alias) that cannot be paired
       // with the stored entries safely: fetch them again.
       for (const e of entries) e.session = null;
+      if (entries.length) changed = true;
       const firstSeen = entries.length ? Math.min(...entries.map((e) => e.firstSeen)) : t;
       todo.push({ msgs, prevs: entries, firstSeen, date: msgs[0].date });
     }
     const pendingPrevs = new Set(todo.flatMap((g) => g.prevs.map((e) => e.id)));
     for (const id of Object.keys(ctx.index)) {
-      if (!keep.has(id) && !pendingPrevs.has(id)) delete ctx.index[id];
+      if (!keep.has(id) && !pendingPrevs.has(id)) drop(id);
     }
-    ctx.dirty.add("index");
+    if (changed) ctx.dirty.add("index");
 
     todo.sort((a, b) => new Date(b.date ?? 0).getTime() - new Date(a.date ?? 0).getTime());
     let fetched = 0;
@@ -341,6 +400,40 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
     return plans.sort((a, b) => a.plan.dueAt - b.plan.dueAt);
   }
 
+  /**
+   * When the next run is needed: the next due mail or retry, the next re-scan, or soon if
+   * there is a backlog. Mails whose folder is missing do not count, a folder event or the
+   * heartbeat picks them up. Returns null when there is nothing to watch.
+   */
+  function nextWakeAt(ctx, session, t, backlog) {
+    if (!ctx.config.accountId) return null;
+    let next = (ctx.status.scan?.at ?? t) + L.rescanMinutes * 60_000;
+    if (backlog || ctx.status.scan?.complete === false) next = Math.min(next, t + L.backlogMs);
+    const missing = new Set((ctx.status.folderProblems ?? []).map((p) => p.folder));
+    for (const e of Object.values(ctx.index)) {
+      if (e.session !== session) continue;
+      const p = planEntry(e, ctx.rules, ctx.config.recipientHeaders, t);
+      if (p.action === "keep" || missing.has(p.rule.folder)) continue;
+      if (p.action === "move") {
+        if (!(ctx.config.dryRun && e.dryRunReported === p.rule.folder)) next = Math.min(next, t + L.backlogMs);
+        continue;
+      }
+      next = Math.min(next, p.dueAt + L.coalesceMs);
+    }
+    return Math.max(next, t + 1_000);
+  }
+
+  async function schedule(when) {
+    if (when === scheduledWake) return;
+    try {
+      if (when === null) await api.alarms.clear(ALARM_DUE);
+      else await api.alarms.create(ALARM_DUE, { when });
+      scheduledWake = when;
+    } catch {
+      // the hourly heartbeat still runs
+    }
+  }
+
   function updateFolderProblems(ctx, problems) {
     const before = JSON.stringify(ctx.status.folderProblems ?? []);
     if (before === JSON.stringify(problems)) return;
@@ -363,55 +456,86 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
     };
   }
 
-  /** Verifies that the message is still the one we classified and still in the inbox, then moves it. */
-  async function moveOne(ctx, entry, plan, target, inbox) {
+  /** Is the message still the one we classified, and still in the inbox? Drops the entry if not. */
+  async function verify(ctx, entry, plan, inbox) {
     let current = null;
     try {
       current = await api.messages.get(entry.msgId);
     } catch {
       current = null;
     }
-    if (!current || messageKey(current) !== entry.key) {
-      delete ctx.index[entry.id];
-      ctx.dirty.add("index");
-      addLog(ctx, { kind: "info", ...logFields(entry, plan), text: "Mail gibt es nicht mehr (gelöscht oder verschoben), übersprungen" });
-      return;
-    }
-    if (!sameFolder(current.folder, inbox)) {
-      delete ctx.index[entry.id];
-      ctx.dirty.add("index");
-      addLog(ctx, { kind: "info", ...logFields(entry, plan), text: "Liegt nicht mehr im Posteingang, übersprungen" });
-      return;
-    }
-    try {
-      await api.messages.move([entry.msgId], target.id);
-    } catch (e) {
-      entry.attempts = (entry.attempts ?? 0) + 1;
-      entry.lastError = errorText(e);
-      ctx.dirty.add("index");
-      let text = `Verschieben fehlgeschlagen (Versuch ${entry.attempts}): ${entry.lastError}`;
-      if (entry.attempts >= L.maxAttempts) {
-        entry.gaveUp = true;
-        text += ". Kein weiterer Versuch bis zum nächsten Start oder \"Jetzt prüfen\"";
-      } else {
-        const wait = RETRY_MINUTES[Math.min(entry.attempts - 1, RETRY_MINUTES.length - 1)];
-        entry.nextTryAt = now() + wait * 60_000;
-        text += `. Neuer Versuch in ${wait} min`;
-      }
-      addLog(ctx, { kind: "error", ...logFields(entry, plan), text });
-      return;
-    }
+    let text = null;
+    if (!current || messageKey(current) !== entry.key) text = "Mail gibt es nicht mehr (gelöscht oder verschoben), übersprungen";
+    else if (!sameFolder(current.folder, inbox)) text = "Liegt nicht mehr im Posteingang, übersprungen";
+    if (!text) return true;
+    delete ctx.index[entry.id];
+    ctx.dirty.add("index");
+    addLog(ctx, { kind: "info", ...logFields(entry, plan), text });
+    return false;
+  }
+
+  function moved(ctx, { entry, plan }) {
     ctx.history[`${entry.key}|${plan.rule.folder}`] = now();
     delete ctx.index[entry.id];
     ctx.dirty.add("history").add("index");
     addLog(ctx, { kind: "moved", ...logFields(entry, plan) });
+  }
+
+  function moveFailed(ctx, { entry, plan }, e) {
+    entry.attempts = (entry.attempts ?? 0) + 1;
+    entry.lastError = errorText(e);
+    ctx.dirty.add("index");
+    let text = `Verschieben fehlgeschlagen (Versuch ${entry.attempts}): ${entry.lastError}`;
+    if (entry.attempts >= L.maxAttempts) {
+      entry.gaveUp = true;
+      text += ". Kein weiterer Versuch bis zum nächsten Start oder \"Jetzt prüfen\"";
+    } else {
+      const wait = RETRY_MINUTES[Math.min(entry.attempts - 1, RETRY_MINUTES.length - 1)];
+      entry.nextTryAt = now() + wait * 60_000;
+      text += `. Neuer Versuch in ${wait} min`;
+    }
+    addLog(ctx, { kind: "error", ...logFields(entry, plan), text });
+  }
+
+  /**
+   * Moves all items for one folder with a single messages.move (one IMAP command). If
+   * that fails, each mail is tried on its own, so one bad mail does not block the rest.
+   */
+  async function moveBatch(ctx, items, target) {
+    try {
+      await api.messages.move(
+        items.map((i) => i.entry.msgId),
+        target.id,
+      );
+      for (const item of items) moved(ctx, item);
+    } catch (e) {
+      if (items.length === 1) {
+        moveFailed(ctx, items[0], e);
+      } else {
+        for (const item of items) {
+          try {
+            await api.messages.move([item.entry.msgId], target.id);
+            moved(ctx, item);
+          } catch (single) {
+            moveFailed(ctx, item, single);
+          }
+        }
+      }
+    }
     await save(ctx); // checkpoint: a run that is cut off later must not lose this
   }
 
+  /** Moves (or in DRY_RUN reports) what is due. Returns whether a backlog is left. */
   async function moveDue(ctx, account, inbox, session) {
     const { targets, problems } = resolveTargets(account.rootFolder, ctx.rules);
     updateFolderProblems(ctx, problems);
     const plans = duePlans(ctx, session, now());
+    if (plans.length === 0) {
+      ctx.status.lastBatch = { moves: 0, deferred: 0 };
+      return false;
+    }
+    await load("history");
+    const batches = new Map(); // folder -> items
     let moves = 0;
     let deferred = 0;
     for (const { entry, plan } of plans) {
@@ -428,25 +552,37 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
         continue;
       }
       moves++;
-      await moveOne(ctx, entry, plan, target, inbox);
+      if (!(await verify(ctx, entry, plan, inbox))) continue;
+      if (!batches.has(plan.rule.folder)) batches.set(plan.rule.folder, { target, items: [] });
+      batches.get(plan.rule.folder).items.push({ entry, plan });
     }
+    for (const { target, items } of batches.values()) await moveBatch(ctx, items, target);
     ctx.status.lastBatch = { moves, deferred };
+    return deferred > 0;
   }
 
   async function runTick(reasons) {
-    const ctx = await load();
+    const ctx = await load("index", "status");
     const t0 = now();
     const status = ctx.status;
+    const quiet = {
+      error: status.error ?? null,
+      configProblems: JSON.stringify(status.configProblems ?? []),
+      dryRun: status.dryRun,
+      nextRunAt: status.nextRunAt,
+    };
     status.lastRun = { at: t0, reasons: [...reasons] };
     status.configProblems = ctx.configProblems;
     status.dryRun = ctx.config.dryRun;
-    ctx.dirty.add("status");
+    let busy = false;
+    let backlog = false;
+    let session = null;
     try {
       if (!ctx.config.accountId) {
         status.error = null;
         return;
       }
-      const session = await getSession();
+      session = await getSession();
       if (reasons.has("manual")) {
         for (const e of Object.values(ctx.index)) {
           if (e.gaveUp) {
@@ -458,23 +594,37 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
         }
       }
       const needScan = scanNeeded(ctx, session, t0, reasons);
-      if (!needScan && duePlans(ctx, session, t0).length === 0) {
+      if (!needScan && !reasons.has("folders") && duePlans(ctx, session, t0).length === 0) {
         status.error = null;
-        return; // nothing to do: no API calls at all
+        return; // nothing to do: no message API calls at all
       }
+      busy = true;
       const { account, inbox } = await openAccount(ctx);
       status.account = account.name;
       if (needScan) await scan(ctx, inbox, session);
-      await moveDue(ctx, account, inbox, session);
+      backlog = await moveDue(ctx, account, inbox, session);
       status.error = null;
     } catch (e) {
       const text = errorText(e);
       if (status.error !== text) addLog(ctx, { kind: "error", text });
       status.error = text;
+      busy = true;
     } finally {
       status.lastRun.ms = now() - t0;
-      ctx.dirty.add("status"); // checkpoints in between may have cleared the flag
+      status.nextRunAt = session ? nextWakeAt(ctx, session, now(), backlog) : null;
+      // An idle alarm run only writes the status if something visible changed, so a quiet
+      // mailbox causes no storage writes at all.
+      const visible =
+        busy ||
+        quiet.error !== (status.error ?? null) ||
+        quiet.configProblems !== JSON.stringify(status.configProblems) ||
+        quiet.dryRun !== status.dryRun ||
+        quiet.nextRunAt !== status.nextRunAt ||
+        ctx.dirty.size > 0 ||
+        ctx.pendingLog.length > 0;
+      if (visible || reasons.size !== 1 || !reasons.has("alarm")) ctx.dirty.add("status");
       await save(ctx);
+      await schedule(status.nextRunAt);
       await updateBadge(status.error || status.folderProblems?.length ? "!" : ctx.config.dryRun ? "TEST" : "");
     }
   }
@@ -496,6 +646,7 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
    * a request during a running run queues exactly one more.
    */
   function tick(reason = "alarm") {
+    if (reason === "config") configStale = true;
     tickReasons.add(reason);
     if (tickQueued) return tickQueued;
     tickQueued = exclusive(async () => {
@@ -507,13 +658,18 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
     return tickQueued;
   }
 
-  /** messages.onNewMailReceived */
+  /** messages.onNewMailReceived. Other folders and accounts are ignored before any storage access. */
   async function onNewMail(folder, messageList) {
-    const msgs = await collect(messageList);
     let added = false;
     await exclusive(async () => {
       const ctx = await load();
-      if (!isWatchedInbox(ctx, folder) || msgs.length === 0) return;
+      if (!isWatchedInbox(ctx, folder)) {
+        // Unread pages of a list stay open in Thunderbird until they are read or aborted.
+        if (messageList?.id) await api.messages.abortList(messageList.id).catch(() => {});
+        return;
+      }
+      const msgs = await collect(messageList);
+      if (msgs.length === 0) return;
       await addMessages(ctx, msgs, await getSession());
       added = true;
       await save(ctx);
@@ -524,20 +680,21 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
   /**
    * messages.onMoved: forget what left the inbox, track what was moved into it. The add-on
    * itself never moves into the inbox, so whatever arrives there this way was the user's
-   * decision and stays.
+   * decision and stays. Moves elsewhere in Thunderbird cost nothing but the config check.
    */
   async function onMoved(originalList, movedList) {
-    const before = await collect(originalList);
-    const after = await collect(movedList);
     let incoming = 0;
     await exclusive(async () => {
       const ctx = await load();
       if (!ctx.config.accountId) return;
+      const before = (await collect(originalList)).filter((m) => isWatchedInbox(ctx, m.folder));
+      const into = (await collect(movedList)).filter((m) => isWatchedInbox(ctx, m.folder));
+      if (before.length === 0 && into.length === 0) return;
       const session = await getSession();
-      removeByMsgIds(ctx, new Set(before.filter((m) => isWatchedInbox(ctx, m.folder)).map((m) => m.id)), session);
-      const into = after.filter((m) => isWatchedInbox(ctx, m.folder));
+      await load("index");
+      removeByMsgIds(ctx, new Set(before.map((m) => m.id)), session);
       incoming = into.length;
-      await addMessages(ctx, into, session, { byUser: true });
+      if (incoming) await addMessages(ctx, into, session, { byUser: true });
       await save(ctx);
     });
     if (incoming) await tick("moved");
@@ -545,12 +702,24 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
 
   /** messages.onDeleted */
   async function onDeleted(list) {
-    const gone = await collect(list);
     await exclusive(async () => {
       const ctx = await load();
+      if (!ctx.config.accountId) return;
+      // Deleted messages may come without folder information; only then look at all of them.
+      const gone = (await collect(list)).filter((m) => !m.folder || isWatchedInbox(ctx, m.folder));
+      if (gone.length === 0) return;
+      await load("index");
       removeByMsgIds(ctx, new Set(gone.map((m) => m.id)), await getSession());
       await save(ctx);
     });
+  }
+
+  /** folders.onCreated/onRenamed/onMoved/onDeleted: a missing target may exist now. */
+  function onFoldersChanged(folder) {
+    return exclusive(async () => {
+      const ctx = await load();
+      return !!ctx.config.accountId && (!folder?.accountId || folder.accountId === ctx.config.accountId);
+    }).then((relevant) => (relevant ? tick("folders") : undefined));
   }
 
   /** Commands from the options page. */
@@ -561,15 +730,16 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
         return { ok: true };
       case "clearLog":
         await exclusive(async () => {
-          const ctx = await load();
+          const ctx = await load("log");
           ctx.log = [];
+          ctx.pendingLog = [];
           ctx.dirty.add("log");
           await save(ctx);
         });
         return { ok: true };
       case "resetIndex":
         await exclusive(async () => {
-          const ctx = await load();
+          const ctx = await load("index", "status");
           ctx.index = {};
           ctx.status.scan = null;
           ctx.dirty.add("index").add("status");
@@ -582,5 +752,5 @@ export function createSorter({ api, now = () => Date.now(), limits = {} }) {
     }
   }
 
-  return { tick, onNewMail, onMoved, onDeleted, command, exclusive };
+  return { tick, onNewMail, onMoved, onDeleted, onFoldersChanged, command, exclusive };
 }
