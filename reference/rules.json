@@ -1,0 +1,49 @@
+{
+  "defaultDelayMinutes": 45,
+  "recipientHeaders": [
+    "X-Original-To",
+    "Delivered-To",
+    "Envelope-To",
+    "To",
+    "Cc"
+  ],
+  "rules": [
+    {
+      "address": "finanzen@braunben.de",
+      "folder": "INBOX/finanzen@braunben.de"
+    },
+    {
+      "address": "job@braunben.de",
+      "folder": "INBOX/job@braunben.de"
+    },
+    {
+      "address": "schule@braunben.de",
+      "folder": "INBOX/schule@braunben.de"
+    },
+    {
+      "address": "apple@braunben.de",
+      "folder": "INBOX/apple@brauben.de"
+    },
+    {
+      "address": "dev@braunben.de",
+      "folder": "INBOX/dev@braunben.de"
+    },
+    {
+      "address": "privat@braunben.de",
+      "folder": "INBOX/privat@braunben.de"
+    },
+    {
+      "address": "social@braunben.de",
+      "folder": "INBOX/social@braunben.de"
+    },
+    {
+      "address": "gaming@braunben.de",
+      "folder": "INBOX/gaming@braunben.de"
+    },
+    {
+      "address": "spam@braunben.de",
+      "folder": "INBOX/spam@braunben.de",
+      "delayMinutes": 0
+    }
+  ]
+}

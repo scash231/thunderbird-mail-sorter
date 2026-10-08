@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Mail-Sortierer (verzögert)",
+  "short_name": "Mail-Sortierer",
+  "version": "1.0.0",
+  "description": "Verschiebt Mails nach einer Wartezeit aus dem Posteingang in Unterordner, je nach Empfängeradresse.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "mail-sorter@braunben.de",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "type": "module"
+  },
+  "permissions": ["accountsRead", "messagesRead", "messagesMove", "storage", "alarms"],
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "Mail-Sortierer: Status und Einstellungen",
+    "default_label": "Mail-Sortierer",
+    "default_icon": "icons/icon.svg"
+  },
+  "icons": {
+    "16": "icons/icon.svg",
+    "32": "icons/icon.svg",
+    "64": "icons/icon.svg"
+  }
+}

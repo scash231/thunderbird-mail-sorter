@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mail-Sortierer</title>
+  <link rel="stylesheet" href="options.css">
+  <script type="module" src="options.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="title">
+      <h1>Mail-Sortierer</h1>
+      <span id="mode-badge" class="badge"></span>
+    </div>
+    <div class="top-actions">
+      <span id="last-run" class="muted"></span>
+      <button id="run-now" type="button">Jetzt prüfen</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button type="button" role="tab" data-tab="status" aria-selected="true">Status</button>
+    <button type="button" role="tab" data-tab="settings" aria-selected="false">Einstellungen</button>
+  </nav>
+
+  <main>
+    <section id="tab-status" class="tab">
+      <div id="alerts"></div>
+
+      <div class="cards">
+        <div class="card"><span class="num" id="c-waiting">0</span><span>wartend</span></div>
+        <div class="card"><span class="num" id="c-due">0</span><span>fällig</span></div>
+        <div class="card"><span class="num" id="c-nomatch">0</span><span>nicht zugeordnet</span></div>
+        <div class="card"><span class="num" id="c-inbox">0</span><span>im Posteingang</span></div>
+      </div>
+      <p id="scan-info" class="muted"></p>
+
+      <h2>Wartende Mails</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Betreff</th><th>Zielordner</th><th>Entschieden durch</th><th>Eingang</th><th>Verschieben</th></tr>
+          </thead>
+          <tbody id="waiting-body"></tbody>
+        </table>
+      </div>
+      <p id="waiting-empty" class="empty">Keine wartenden Mails.</p>
+
+      <details id="others">
+        <summary>Weitere Mails im Posteingang (<span id="others-count">0</span>)</summary>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Betreff</th><th>Von</th><th>Grund</th></tr></thead>
+            <tbody id="others-body"></tbody>
+          </table>
+        </div>
+      </details>
+
+      <div class="section-head">
+        <h2>Protokoll</h2>
+        <div class="inline">
+          <label>Zeigen
+            <select id="log-filter">
+              <option value="all">alles</option>
+              <option value="moves">nur Verschiebungen</option>
+              <option value="error">nur Fehler</option>
+            </select>
+          </label>
+          <button id="clear-log" type="button" class="secondary">Protokoll leeren</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Zeit</th><th>Aktion</th><th>Betreff</th><th>Zielordner</th><th>Header</th><th>Details</th></tr>
+          </thead>
+          <tbody id="log-body"></tbody>
+        </table>
+      </div>
+      <p id="log-empty" class="empty">Noch keine Einträge.</p>
+    </section>
+
+    <section id="tab-settings" class="tab" hidden>
+      <div id="settings-problems"></div>
+
+      <fieldset>
+        <legend>Allgemein</legend>
+        <div class="grid">
+          <label for="account">Konto</label>
+          <div>
+            <select id="account"></select>
+            <p class="hint">Nur der Posteingang dieses Kontos wird beobachtet.</p>
+          </div>
+
+          <label for="dry-run">DRY_RUN (Testmodus)</label>
+          <div>
+            <label class="switch"><input id="dry-run" type="checkbox"> nur anzeigen, nichts verschieben</label>
+            <p id="dry-run-warning" class="warn" hidden>Nach dem Speichern werden fällige Mails wirklich verschoben.</p>
+          </div>
+
+          <label for="default-delay">Standardverzögerung</label>
+          <div><input id="default-delay" type="number" min="0" max="10080" step="1"> Minuten</div>
+
+          <label for="max-moves">Höchstens pro Lauf</label>
+          <div>
+            <input id="max-moves" type="number" min="1" max="200" step="1"> Mails
+            <p class="hint">Ein Lauf passiert jede Minute. Was darüber liegt, kommt im nächsten Lauf dran.</p>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Regeln</legend>
+        <p class="hint">Reihenfolge = Priorität (oben = höchste). Sie gilt, wenn ein Header mehrere deiner Adressen enthält. Mehrere Adressen pro Ordner mit Komma trennen. Leere Verzögerung = Standard.</p>
+        <div class="table-wrap">
+          <table class="rules">
+            <thead>
+              <tr><th>#</th><th>Adresse(n)</th><th>Zielordner</th><th>Verzögerung (min)</th><th></th></tr>
+            </thead>
+            <tbody id="rules-body"></tbody>
+          </table>
+        </div>
+        <button id="add-rule" type="button" class="secondary">Regel hinzufügen</button>
+      </fieldset>
+
+      <fieldset>
+        <legend>Header-Reihenfolge</legend>
+        <p class="hint">Der erste Header, der eine deiner Adressen enthält, entscheidet. Von jedem Header zählt nur das oberste Vorkommen.</p>
+        <ol id="headers-list" class="headers"></ol>
+        <div class="inline">
+          <input id="new-header" type="text" placeholder="z.B. X-Delivered-To">
+          <button id="add-header" type="button" class="secondary">Hinzufügen</button>
+        </div>
+      </fieldset>
+
+      <div class="save-bar">
+        <button id="save" type="button">Speichern</button>
+        <button id="discard" type="button" class="secondary">Änderungen verwerfen</button>
+        <button id="defaults" type="button" class="secondary">Vorgaben laden</button>
+        <span id="save-state" class="muted"></span>
+      </div>
+
+      <fieldset>
+        <legend>Export / Import (JSON)</legend>
+        <p class="hint">Format wie reference/rules.json. Konto und DRY_RUN werden nicht exportiert und beim Import nicht geändert.</p>
+        <textarea id="json" rows="12" spellcheck="false"></textarea>
+        <div class="inline">
+          <button id="export" type="button" class="secondary">Aktuelle Regeln anzeigen</button>
+          <button id="copy" type="button" class="secondary">Kopieren</button>
+          <button id="download" type="button" class="secondary">Als Datei speichern</button>
+          <button id="import" type="button" class="secondary">Aus Textfeld importieren</button>
+          <label class="file secondary">Datei importieren <input id="import-file" type="file" accept=".json,application/json"></label>
+        </div>
+        <p id="json-state" class="muted"></p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Wartung</legend>
+        <p class="hint">Vergisst die gemerkten Mails und liest den Posteingang neu ein (Header werden dafür neu geladen). Verschobene Mails und das Protokoll bleiben.</p>
+        <button id="reset-index" type="button" class="secondary">Posteingang neu einlesen</button>
+      </fieldset>
+    </section>
+  </main>
+</body>
+</html>
